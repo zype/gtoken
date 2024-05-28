@@ -2,16 +2,15 @@ package main
 
 import (
 	"context"
-	"os"
-	"strings"
-	"testing"
-
 	cmp "github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	fake "k8s.io/client-go/kubernetes/fake"
+	"os"
+	"strings"
+	"testing"
 )
 
 func TestMain(m *testing.M) {
@@ -156,127 +155,132 @@ func Test_mutatingWebhook_mutateContainers(t *testing.T) {
 
 //nolint:funlen
 func Test_mutatingWebhook_mutatePod(t *testing.T) {
-	type fields struct {
-		image      string
-		pullPolicy string
-		volumeName string
-		volumePath string
-		tokenFile  string
-	}
-	type args struct {
-		pod                *corev1.Pod
-		ns                 string
-		serviceAccountName string
-		annotations        map[string]string
-		dryRun             bool
-	}
-	tests := []struct {
-		name      string
-		fields    fields
-		args      args
-		wantErr   bool
-		wantedPod *corev1.Pod
-	}{
-		{
-			name: "mutate pod",
-			fields: fields{
-				image:      "doitintl/gtoken:test",
-				pullPolicy: "Always",
-				volumeName: "test-volume-name",
-				volumePath: "/test-volume-path",
-				tokenFile:  "test-token",
-			},
-			args: args{
-				pod: &corev1.Pod{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{
-							{
-								Name:  "TestContainer",
-								Image: "test-image",
-							},
-						},
-						ServiceAccountName: "test-sa",
-					},
-				},
-				ns:                 "test-namespace",
-				serviceAccountName: "test-sa",
-				annotations:        map[string]string{awsRoleArnKey: "arn:aws:iam::123456789012:role/testrole"},
-			},
-			wantedPod: &corev1.Pod{
-				Spec: corev1.PodSpec{
-					InitContainers: []corev1.Container{
-						{
-							Name:    "generate-gcp-id-token",
-							Image:   "doitintl/gtoken:test",
-							Command: []string{"/gtoken", "--file=/test-volume-path/test-token", "--refresh=false"},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse(requestsCPU),
-									corev1.ResourceMemory: resource.MustParse(requestsMemory),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse(limitsCPU),
-									corev1.ResourceMemory: resource.MustParse(limitsMemory),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "test-volume-name",
-									MountPath: "/test-volume-path",
-								},
-							},
-							ImagePullPolicy: "Always",
-						},
-					},
-					Containers: []corev1.Container{
-						{
-							Name:         "TestContainer",
-							Image:        "test-image",
-							VolumeMounts: []corev1.VolumeMount{{Name: "test-volume-name", MountPath: "/test-volume-path"}},
-							Env: []corev1.EnvVar{
-								{Name: awsWebIdentityTokenFile, Value: "/test-volume-path/test-token"},
-								{Name: awsRoleArn, Value: "arn:aws:iam::123456789012:role/testrole"},
-								{Name: awsRoleSessionName, Value: "gtoken-webhook-" + strings.Repeat("0", 16)},
-							},
-						},
-						{
-							Name:    "update-gcp-id-token",
-							Image:   "doitintl/gtoken:test",
-							Command: []string{"/gtoken", "--file=/test-volume-path/test-token", "--refresh=true"},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse(requestsCPU),
-									corev1.ResourceMemory: resource.MustParse(requestsMemory),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse(limitsCPU),
-									corev1.ResourceMemory: resource.MustParse(limitsMemory),
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "test-volume-name",
-									MountPath: "/test-volume-path",
-								},
-							},
-							ImagePullPolicy: "Always",
-						},
-					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "test-volume-name",
-							VolumeSource: corev1.VolumeSource{
-								EmptyDir: &corev1.EmptyDirVolumeSource{
-									Medium: corev1.StorageMediumMemory,
-								},
-							},
-						},
-					},
-					ServiceAccountName: "test-sa",
-				},
-			},
-		},
-	}
+	containerRestartPolicy := corev1.ContainerRestartPolicyAlways
+
+  type fields struct {
+    image      string
+    pullPolicy string
+    volumeName string
+    volumePath string
+    tokenFile  string
+  }
+  type args struct {
+    pod                *corev1.Pod
+    ns                 string
+    serviceAccountName string
+    annotations        map[string]string
+    dryRun             bool
+  }
+  tests := []struct {
+    name      string
+    fields    fields
+    args      args
+    wantErr   bool
+    wantedPod *corev1.Pod
+  }{
+    {
+      name: "mutate pod",
+      fields: fields{
+        image:      "doitintl/gtoken:test",
+        pullPolicy: "Always",
+        volumeName: "test-volume-name",
+        volumePath: "/test-volume-path",
+        tokenFile:  "test-token",
+      },
+      args: args{
+        pod: &corev1.Pod{
+          Spec: corev1.PodSpec{
+            Containers: []corev1.Container{
+              {
+                Name:  "TestContainer",
+                Image: "test-image",
+              },
+            },
+            ServiceAccountName: "test-sa",
+          },
+        },
+        ns:                 "test-namespace",
+        serviceAccountName: "test-sa",
+        annotations:        map[string]string{awsRoleArnKey: "arn:aws:iam::123456789012:role/testrole"},
+      },
+      wantedPod: &corev1.Pod{
+        Spec: corev1.PodSpec{
+          InitContainers: []corev1.Container{
+            {
+              Name:    "generate-gcp-id-token",
+              Image:   "doitintl/gtoken:test",
+              Command: []string{"/gtoken", "--file=/test-volume-path/test-token", "--refresh=false"},
+              Resources: corev1.ResourceRequirements{
+                Requests: corev1.ResourceList{
+                  corev1.ResourceCPU:    resource.MustParse(requestsCPU),
+                  corev1.ResourceMemory: resource.MustParse(requestsMemory),
+                },
+                Limits: corev1.ResourceList{
+                  corev1.ResourceCPU:    resource.MustParse(limitsCPU),
+                  corev1.ResourceMemory: resource.MustParse(limitsMemory),
+                },
+              },
+              VolumeMounts: []corev1.VolumeMount{
+                {
+                  Name:      "test-volume-name",
+                  MountPath: "/test-volume-path",
+                },
+              },
+              ImagePullPolicy: "Always",
+            },
+            {
+              Name:          "update-gcp-id-token",
+              Image:         "doitintl/gtoken:test",
+              RestartPolicy: &containerRestartPolicy,
+              Command:       []string{"/gtoken", "--file=/test-volume-path/test-token", "--refresh=true"},
+              Resources: corev1.ResourceRequirements{
+                Requests: corev1.ResourceList{
+                  corev1.ResourceCPU:    resource.MustParse(requestsCPU),
+                  corev1.ResourceMemory: resource.MustParse(requestsMemory),
+                },
+                Limits: corev1.ResourceList{
+                  corev1.ResourceCPU:    resource.MustParse(limitsCPU),
+                  corev1.ResourceMemory: resource.MustParse(limitsMemory),
+                },
+              },
+              VolumeMounts: []corev1.VolumeMount{
+                {
+                  Name:      "test-volume-name",
+                  MountPath: "/test-volume-path",
+                },
+              },
+              ImagePullPolicy: "Always",
+            },
+          },
+          Containers: []corev1.Container{
+            {
+              Name:         "TestContainer",
+              Image:        "test-image",
+              VolumeMounts: []corev1.VolumeMount{{Name: "test-volume-name", MountPath: "/test-volume-path"}},
+              Env: []corev1.EnvVar{
+                {Name: awsWebIdentityTokenFile, Value: "/test-volume-path/test-token"},
+                {Name: awsRoleArn, Value: "arn:aws:iam::123456789012:role/testrole"},
+                {Name: awsRoleSessionName, Value: "gtoken-webhook-" + strings.Repeat("0", 16)},
+              },
+            },
+          },
+          Volumes: []corev1.Volume{
+            {
+              Name: "test-volume-name",
+              VolumeSource: corev1.VolumeSource{
+                EmptyDir: &corev1.EmptyDirVolumeSource{
+                  Medium: corev1.StorageMediumMemory,
+                },
+              },
+            },
+          },
+          ServiceAccountName: "test-sa",
+        },
+      },
+    },
+  }
+
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sa := &corev1.ServiceAccount{
