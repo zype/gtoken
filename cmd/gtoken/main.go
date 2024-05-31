@@ -112,7 +112,7 @@ func main() {
 		Action:  generateIDTokenCmd,
 		Version: Version,
 	}
-	cli.VersionPrinter = func(c *cli.Context) {
+	cli.VersionPrinter = func(_ *cli.Context) {
 		fmt.Printf("gtoken %s\n", Version)
 		fmt.Printf("  Build date: %s\n", BuildDate)
 		fmt.Printf("  Built with: %s\n", runtime.Version())
