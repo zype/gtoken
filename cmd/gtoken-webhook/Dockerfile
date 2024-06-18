@@ -3,11 +3,13 @@
 #
 # ----- Go Builder Image ------
 #
-FROM golang:1.17-alpine AS builder
+FROM golang:1.22.2-alpine3.19 AS builder
+
+ENV GOROOT /usr/local/go
 
 # curl git bash
 RUN apk add --no-cache curl git bash make
-COPY --from=golangci/golangci-lint:v1.45-alpine /usr/bin/golangci-lint /usr/bin
+COPY --from=golangci/golangci-lint:v1.59.0-alpine /usr/bin/golangci-lint /usr/bin
 
 #
 # ----- Build and Test Image -----
@@ -32,7 +34,7 @@ RUN make
 #
 # ------ get latest CA certificates
 #
-FROM alpine:3.15 as certs
+FROM alpine:3.19 as certs
 RUN apk --update add ca-certificates
 
 
@@ -45,6 +47,6 @@ FROM scratch
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # this is the last commabd since it's never cached
-COPY --from=build /go/src/gtoken-webhook/.bin/github.com/doitintl/gtoken-webhook /gtoken-webhook
+COPY --from=build /go/src/gtoken-webhook/.bin/gtoken-webhook /gtoken-webhook
 
 ENTRYPOINT ["/gtoken-webhook"]

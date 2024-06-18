@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -28,27 +27,26 @@ import (
 	kubernetesConfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
-/* #nosec */
 const (
 	// secretsInitContainer is the default gtoken container from which to pull the 'gtoken' binary.
-	gtokenInitImage = "doitintl/gtoken:latest"
+	gtokenInitImage = "doitintl/gtoken:latest" // #nosec G101
 
 	// tokenVolumeName is the name of the volume where the generated id token will be stored
-	tokenVolumeName = "gtoken-volume"
+	tokenVolumeName = "gtoken-volume" // #nosec G101
 
 	// tokenVolumePath is the mount path where the generated id token will be stored
-	tokenVolumePath = "/var/run/secrets/aws/token"
+	tokenVolumePath = "/var/run/secrets/aws/token" // #nosec G101
 
 	// token file name
-	tokenFileName = "gtoken"
+	tokenFileName = "gtoken" // #nosec G101
 
 	// AWS annotation key; used to annotate Kubernetes Service Account with AWS Role ARN
-	awsRoleArnKey = "amazonaws.com/role-arn"
+	awsRoleArnKey = "amazonaws.com/role-arn" // #nosec G101
 
 	// AWS Web Identity Token ENV
-	awsWebIdentityTokenFile = "AWS_WEB_IDENTITY_TOKEN_FILE"
-	awsRoleArn              = "AWS_ROLE_ARN"
-	awsRoleSessionName      = "AWS_ROLE_SESSION_NAME"
+	awsWebIdentityTokenFile = "AWS_WEB_IDENTITY_TOKEN_FILE" // #nosec G101
+	awsRoleArn              = "AWS_ROLE_ARN"                // #nosec G101
+	awsRoleSessionName      = "AWS_ROLE_SESSION_NAME"       // #nosec G101
 )
 
 var (
@@ -79,9 +77,9 @@ type mutatingWebhook struct {
 var logger *log.Logger
 
 // Returns an int >= min, < max
-func randomInt(min, max int) int {
+func randomInt(minVal, maxVal int) int {
 	//nolint:gosec
-	return min + rand.Intn(max-min)
+	return minVal + rand.Intn(maxVal-minVal)
 }
 
 // Generate a random string of a-z chars with len = l
@@ -89,7 +87,7 @@ func randomString(l int) string {
 	if testMode {
 		return strings.Repeat("0", 16)
 	}
-	rand.Seed(time.Now().UnixNano())
+	rand.NewSource(time.Now().UnixNano())
 	bytes := make([]byte, l)
 	for i := 0; i < l; i++ {
 		bytes[i] = byte(randomInt(97, 122))
@@ -106,7 +104,7 @@ func newK8SClient() (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(kubeConfig)
 }
 
-func healthzHandler(w http.ResponseWriter, r *http.Request) {
+func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(200)
 }
 
@@ -115,7 +113,7 @@ func serveMetrics(addr string) {
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	err := http.ListenAndServe(addr, mux)
+	err := http.ListenAndServe(addr, mux) // #nosec G114
 	if err != nil {
 		logger.WithError(err).Fatal("error serving telemetry")
 	}
@@ -215,8 +213,8 @@ func (mw *mutatingWebhook) mutatePod(ctx context.Context, pod *corev1.Pod, ns st
 			mw.image, mw.pullPolicy, mw.volumeName, mw.volumePath, mw.tokenFile, false)}, pod.Spec.InitContainers...)
 		logger.Debug("successfully prepended pod init containers to spec")
 		// append sidekick gtoken update container (as last container)
-		pod.Spec.Containers = append(pod.Spec.Containers, getGtokenContainer("update-gcp-id-token",
-			mw.image, mw.pullPolicy, mw.volumeName, mw.volumePath, mw.tokenFile, true))
+		pod.Spec.InitContainers = append(pod.Spec.InitContainers, []corev1.Container{getGtokenContainer("update-gcp-id-token",
+			mw.image, mw.pullPolicy, mw.volumeName, mw.volumePath, mw.tokenFile, true)}...)
 		logger.Debug("successfully prepended pod sidekick containers to spec")
 		// append empty gtoken volume
 		pod.Spec.Volumes = append(pod.Spec.Volumes, getGtokenVolume(mw.volumeName))
@@ -239,7 +237,7 @@ func getGtokenVolume(volumeName string) corev1.Volume {
 
 func getGtokenContainer(name, image, pullPolicy, volumeName, volumePath, tokenFile string,
 	refresh bool) corev1.Container {
-	return corev1.Container{
+	container := corev1.Container{
 		Name:            name,
 		Image:           image,
 		ImagePullPolicy: corev1.PullPolicy(pullPolicy),
@@ -261,6 +259,12 @@ func getGtokenContainer(name, image, pullPolicy, volumeName, volumePath, tokenFi
 			},
 		},
 	}
+
+	if refresh {
+		restartPolicy := corev1.ContainerRestartPolicyAlways
+		container.RestartPolicy = &restartPolicy
+	}
+	return container
 }
 
 func init() {
@@ -300,7 +304,7 @@ func (mw *mutatingWebhook) podMutator(ctx context.Context, ar *whmodel.Admission
 	case *corev1.Pod:
 		err := mw.mutatePod(ctx, v, ar.Namespace, ar.DryRun)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to mutate pod: %s", v.Name)
+			return nil, fmt.Errorf("failed to mutate pod: %s", v.Name)
 		}
 		return &mutating.MutatorResult{MutatedObject: v}, nil
 	default:
@@ -352,7 +356,7 @@ func runWebhook(c *cli.Context) error {
 	tlsCertFile := c.String("tls-cert-file")
 	tlsPrivateKeyFile := c.String("tls-private-key-file")
 
-	if len(telemetryAddress) > 0 {
+	if telemetryAddress != "" {
 		// Serving metrics without TLS on separated address
 		go serveMetrics(telemetryAddress)
 	} else {
@@ -361,10 +365,10 @@ func runWebhook(c *cli.Context) error {
 
 	if tlsCertFile == "" && tlsPrivateKeyFile == "" {
 		logger.Infof("listening on http://%s", listenAddress)
-		err = http.ListenAndServe(listenAddress, mux)
+		err = http.ListenAndServe(listenAddress, mux) // #nosec G114
 	} else {
 		logger.Infof("listening on https://%s", listenAddress)
-		err = http.ListenAndServeTLS(listenAddress, tlsCertFile, tlsPrivateKeyFile, mux)
+		err = http.ListenAndServeTLS(listenAddress, tlsCertFile, tlsPrivateKeyFile, mux) // #nosec G114
 	}
 
 	if err != nil {
