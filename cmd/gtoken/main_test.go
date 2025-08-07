@@ -140,10 +140,17 @@ func Test_generateIDToken(t *testing.T) {
 			mockToken := &gcp.MockToken{}
 			ctx, cancel := context.WithCancel(context.TODO())
 			tt.mockInit(ctx, mockSA, mockToken, tt.args, tt.fields)
-			go func() {
-				time.Sleep(time.Second)
-				cancel()
-			}()
+
+			// For refresh tests, we need to cancel the context to avoid infinite loop
+			// For non-refresh tests, the function should return immediately
+			if tt.args.refresh {
+				go func() {
+					// Cancel after a short delay to test the refresh loop
+					time.Sleep(10 * time.Millisecond)
+					cancel()
+				}()
+			}
+
 			if err := generateIDToken(ctx, mockSA, mockToken, tt.args.file, tt.args.refresh); (err != nil) != tt.wantErr {
 				t.Errorf("generateIDToken() error = %v, wantErr %v", err, tt.wantErr)
 			}
