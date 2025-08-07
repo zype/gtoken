@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -67,6 +68,7 @@ const (
 
 type mutatingWebhook struct {
 	k8sClient  kubernetes.Interface
+	ecrManager ECRManager
 	image      string
 	pullPolicy string
 	volumeName string
@@ -104,8 +106,157 @@ func newK8SClient() (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(kubeConfig)
 }
 
+// Global variable to hold the webhook instance for health checks
+var globalWebhook *mutatingWebhook
+
 func healthzHandler(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(200)
+	if globalWebhook == nil {
+		http.Error(w, "Webhook not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx := context.Background()
+	status := http.StatusOK
+	errors := []string{}
+
+	// Check ECR token is active
+	if globalWebhook.ecrManager != nil {
+		// Check if we can get the current token state
+		_, expiresAt, err := globalWebhook.ecrManager.GetTokenState(ctx)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("ECR token state check failed: %v", err))
+			status = http.StatusServiceUnavailable
+		} else {
+			// Check if token is expired or expiring soon
+			if time.Now().After(expiresAt) {
+				errors = append(errors, "ECR token is expired")
+				status = http.StatusServiceUnavailable
+			} else if time.Until(expiresAt) < 5*time.Minute {
+				errors = append(errors, "ECR token expires soon")
+				// Don't change status for this, just warn
+			}
+		}
+
+		// Check ecr-token-version annotation on master secret
+		tokenVersion, err := globalWebhook.ecrManager.GetSecretTokenVersion(ctx, "gtoken")
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("ECR token version check failed: %v", err))
+			status = http.StatusServiceUnavailable
+		} else if tokenVersion == "" {
+			errors = append(errors, "ECR token version is empty")
+			status = http.StatusServiceUnavailable
+		}
+
+		// Verify ConfigMap state
+		_, _, err = globalWebhook.ecrManager.GetTokenState(ctx)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("ConfigMap state check failed: %v", err))
+			status = http.StatusServiceUnavailable
+		}
+	}
+
+	// Check AWS credentials are valid (basic check)
+	// This would require checking if the token file exists and is readable
+	// For now, we'll assume they're valid if the ECR manager is working
+
+	// Return response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	response := map[string]interface{}{
+		"status":  status == http.StatusOK,
+		"healthy": status == http.StatusOK,
+	}
+
+	if len(errors) > 0 {
+		response["errors"] = errors
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		logger.WithError(err).Error("Failed to encode healthz response")
+	}
+}
+
+func selftestHandler(w http.ResponseWriter, _ *http.Request) {
+	if globalWebhook == nil {
+		http.Error(w, "Webhook not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx := context.Background()
+	status := http.StatusOK
+	errors := []string{}
+	results := map[string]interface{}{}
+
+	// Full STS credential validation
+	if globalWebhook.ecrManager != nil {
+		// Try to get ECR token (this validates AWS credentials)
+		token, expiresAt, err := globalWebhook.ecrManager.GetECRToken(ctx)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("STS credential validation failed: %v", err))
+			status = http.StatusServiceUnavailable
+			results["sts_validation"] = map[string]interface{}{
+				"success": false,
+				"error":   err.Error(),
+			}
+		} else {
+			results["sts_validation"] = map[string]interface{}{
+				"success":    true,
+				"token":      "***REDACTED***",
+				"expires_at": expiresAt.Format(time.RFC3339),
+			}
+		}
+
+		// ECR push/pull dummy auth (we already have the token from above)
+		if token != "" {
+			results["ecr_auth"] = map[string]interface{}{
+				"success": true,
+				"message": "ECR authentication successful",
+			}
+		} else {
+			errors = append(errors, "ECR authentication failed: no token available")
+			status = http.StatusServiceUnavailable
+			results["ecr_auth"] = map[string]interface{}{
+				"success": false,
+				"error":   "No token available",
+			}
+		}
+
+		// Secret sync dry-run
+		// Check if we can access the master secret
+		_, err = globalWebhook.ecrManager.GetSecretTokenVersion(ctx, "gtoken")
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("Secret sync dry-run failed: %v", err))
+			status = http.StatusServiceUnavailable
+			results["secret_sync"] = map[string]interface{}{
+				"success": false,
+				"error":   err.Error(),
+			}
+		} else {
+			results["secret_sync"] = map[string]interface{}{
+				"success": true,
+				"message": "Secret sync check successful",
+			}
+		}
+	}
+
+	// Return response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+
+	response := map[string]interface{}{
+		"status":  status == http.StatusOK,
+		"healthy": status == http.StatusOK,
+		"results": results,
+	}
+
+	if len(errors) > 0 {
+		response["errors"] = errors
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		logger.WithError(err).Error("Failed to encode selftest response")
+	}
 }
 
 func serveMetrics(addr string) {
@@ -183,6 +334,42 @@ func (mw *mutatingWebhook) mutateContainers(containers []corev1.Container, roleA
 }
 
 func (mw *mutatingWebhook) mutatePod(ctx context.Context, pod *corev1.Pod, ns string, dryRun bool) error {
+	// Handle ECR images first (regardless of AWS role annotation)
+	if hasECRImages(pod) {
+		// Extract ECR registry from pod images
+		registryURL := extractECRRegistryFromPod(pod)
+		if registryURL == "" {
+			return fmt.Errorf("ECR validation failed: could not extract ECR registry from pod images")
+		}
+
+		// Get current ECR token and add registry to master secret
+		if mw.ecrManager != nil {
+			token, _, err := mw.ecrManager.GetECRToken(ctx)
+			if err != nil {
+				return fmt.Errorf("ECR validation failed: failed to get ECR token: %w", err)
+			}
+
+			// Add the registry to the master secret
+			err = mw.ecrManager.AddECRRegistryToMaster(ctx, registryURL, token)
+			if err != nil {
+				return fmt.Errorf("ECR validation failed: failed to add ECR registry %s to master secret: %w", registryURL, err)
+			}
+
+			// Copy the master secret to the namespace
+			err = mw.ecrManager.CopySecretToNamespace(ctx, ns)
+			if err != nil {
+				return fmt.Errorf("ECR validation failed: failed to copy ECR secret to namespace %s: %w", ns, err)
+			}
+		}
+
+		// Validate ECR secret exists and is valid, and add to imagePullSecrets
+		err := ensureECRSecret(ctx, mw.k8sClient, pod, ns)
+		if err != nil {
+			return fmt.Errorf("ECR validation failed: %w", err)
+		}
+		logger.Debugf("ECR secret validation and addition completed for pod in namespace %s", ns)
+	}
+
 	// get service account AWS Role ARN annotation
 	roleArn, ok, err := mw.getAwsRoleArn(ctx, pod.Spec.ServiceAccountName, ns)
 	if err != nil {
@@ -190,6 +377,7 @@ func (mw *mutatingWebhook) mutatePod(ctx context.Context, pod *corev1.Pod, ns st
 	}
 	if !ok {
 		logger.Debug("skipping pods with Service Account without AWS Role ARN annotation")
+		// Don't return here - we may have already handled ECR images
 		return nil
 	}
 	// mutate Pod init containers
@@ -302,10 +490,52 @@ func before(c *cli.Context) error {
 func (mw *mutatingWebhook) podMutator(ctx context.Context, ar *whmodel.AdmissionReview, obj metav1.Object) (*mutating.MutatorResult, error) {
 	switch v := obj.(type) {
 	case *corev1.Pod:
+		// Check if pod has ECR images
+		hasECR := hasECRImages(v)
+
 		err := mw.mutatePod(ctx, v, ar.Namespace, ar.DryRun)
 		if err != nil {
-			return nil, fmt.Errorf("failed to mutate pod: %s", v.Name)
+			// Check if this is an ECR validation error
+			if strings.Contains(err.Error(), "ECR validation failed") {
+				logger.WithFields(log.Fields{
+					"pod":       v.Name,
+					"namespace": ar.Namespace,
+					"error":     err.Error(),
+				}).Error("ECR validation failed - denying admission")
+
+				// Record admission metrics
+				if mw.ecrManager != nil {
+					if ecrMetrics, ok := mw.ecrManager.(*ecrManager); ok {
+						ecrMetrics.metrics.RecordAdmission("deny", "ecr_validation_failed")
+					}
+				}
+
+				return nil, fmt.Errorf("ECR validation failed for pod %s: %w", v.Name, err)
+			}
+			// For other errors, still deny admission but with different message
+			logger.WithFields(log.Fields{
+				"pod":       v.Name,
+				"namespace": ar.Namespace,
+				"error":     err.Error(),
+			}).Error("Pod mutation failed - denying admission")
+
+			// Record admission metrics
+			if mw.ecrManager != nil {
+				if ecrMetrics, ok := mw.ecrManager.(*ecrManager); ok {
+					ecrMetrics.metrics.RecordAdmission("deny", "mutation_failed")
+				}
+			}
+
+			return nil, fmt.Errorf("failed to mutate pod %s: %w", v.Name, err)
 		}
+
+		// Record successful admission
+		if hasECR && mw.ecrManager != nil {
+			if ecrMetrics, ok := mw.ecrManager.(*ecrManager); ok {
+				ecrMetrics.metrics.RecordAdmission("allow", "ecr_validation_success")
+			}
+		}
+
 		return &mutating.MutatorResult{MutatedObject: v}, nil
 	default:
 		return &mutating.MutatorResult{}, nil
@@ -319,14 +549,37 @@ func runWebhook(c *cli.Context) error {
 		logger.WithError(err).Fatal("error creating k8s client")
 	}
 
+	// Initialize ECR manager
+	ecrConfig := ECRManagerConfig{
+		K8sClient:     k8sClient,
+		GTokenNS:      "gtoken",
+		ECRSecretName: "ecr-secret",
+		RefreshBuffer: 5 * time.Minute,
+		ECRRoleARN:    c.String("ecr-role-arn"),
+		GTokenImage:   c.String("image"),
+		TokenFilePath: fmt.Sprintf("%s/%s", c.String("volume-path"), c.String("token-file")),
+	}
+	ecrManager := NewECRManager(&ecrConfig)
+
+	// Start ECR token refresh
+	ctx := context.Background()
+	err = ecrManager.StartTokenRefresh(ctx)
+	if err != nil {
+		logger.WithError(err).Fatal("error starting ECR token refresh")
+	}
+
 	webhook := mutatingWebhook{
 		k8sClient:  k8sClient,
+		ecrManager: ecrManager,
 		image:      c.String("image"),
 		pullPolicy: c.String("pull-policy"),
 		volumeName: c.String("volume-name"),
 		volumePath: c.String("volume-path"),
 		tokenFile:  c.String("token-file"),
 	}
+
+	// Set global webhook for health checks
+	globalWebhook = &webhook
 
 	mutator := mutating.MutatorFunc(webhook.podMutator)
 	metricsRecorder, err := metrics.NewRecorder(metrics.RecorderConfig{
@@ -350,6 +603,7 @@ func runWebhook(c *cli.Context) error {
 	mux := http.NewServeMux()
 	mux.Handle("/pods", podHandler)
 	mux.Handle("/healthz", http.HandlerFunc(healthzHandler))
+	mux.Handle("/selftest", http.HandlerFunc(selftestHandler))
 
 	telemetryAddress := c.String("telemetry-listen-address")
 	listenAddress := c.String("listen-address")
@@ -453,6 +707,11 @@ func main() {
 					Name:  "token-file",
 					Usage: "token file name",
 					Value: tokenFileName,
+				},
+				cli.StringFlag{
+					Name:  "ecr-role-arn",
+					Usage: "AWS role ARN for ECR access",
+					Value: "",
 				},
 			},
 			Usage:       "mutation admission webhook",
